@@ -1,42 +1,41 @@
 import { MongoClient, Db, WithId, ObjectId, } from 'mongodb';
 import { default as axios, } from 'axios';
 
-interface ChainTvls {
-    [key: string]: number,
-}
-
-interface TokenBreakdowns { }
-
 interface Protocol {
     id: string
     name: string
-    address: any
-    symbol: string
-    url: string
-    description: string
-    chain: string
-    logo: string
-    audits: string
-    audit_note: any
-    gecko_id: any
-    cmcId: any
-    category: string
-    chains: string[]
-    module: string
-    twitter: string
-    forkedFrom: any[]
-    oracles: any[]
-    listedAt: number
-    methodology: string
     slug: string
-    tvl: number
-    chainTvls: ChainTvls
-    change_1h: number
-    change_1d: number
-    change_7d: number
-    tokenBreakdowns: TokenBreakdowns
-    mcap: any
 }
+
+interface TVL {
+    date: number
+    totalLiquidityUSD: number
+}
+
+interface TokenValue {
+    [key: string]: number
+}
+
+interface ProtocolDetail {
+    id: string
+    name: string
+    chainTvls: {
+        [key: string]: {
+            tvl: Array<TVL>
+            tokensInUsd: Array<{
+                date: number
+                tokens: TokenValue
+            }>
+            tokens: Array<{
+                date: number
+                tokens: TokenValue
+            }>
+        }
+    }
+    currentChainTvls: TokenValue
+}
+
+
 
 class DefiLlamaClient {
     private readonly client: Axios.AxiosInstance;
@@ -51,7 +50,24 @@ class DefiLlamaClient {
         return this.client.get('/protocols').then(res => res.data as Protocol[]);
     }
 
+    async getProtocolDetail(slug: string): Promise<ProtocolDetail> {
+        return this.client.get('/protocol/' + slug).then(res => {
+            console.log(slug, res.status);
+            return res.data as ProtocolDetail;
+        });
+    }
+
 }
+
+type JobUpdateHistory = {
+    id: string,
+    histories: {
+        id: string,
+        updatedAt: string,
+    }[],
+    lastUpdatedIndex: number,
+    lastRunAt: string,
+};
 
 class MongoStorage {
     private readonly mongo: MongoClient;
@@ -64,42 +80,93 @@ class MongoStorage {
 
     async initialize(): Promise<void> {
         await this.mongo.connect();
-        await this.db.collection<Protocol>('protocols').createIndex({ id: 'text', }, { unique: true, });
+        await this.db.collection<Protocol>('protocols').createIndex({ id: 1, }, { unique: true, });
+        await this.db.collection<Protocol>('protocol_tvls').createIndex({ slug: 1, chain: 1, date: 1, }, { unique: true, });
+        await this.db.collection<Protocol>('protocol_tokens').createIndex({ slug: 1, chain: 1, token: 1, date: 1 }, { unique: true, });
+        await this.db.collection<Protocol>('protocol_tokens_in_usd').createIndex({ slug: 1, chain: 1, token: 1, date: 1, }, { unique: true, });
     }
 
-    async updateProtocols(protocols: Protocol[]): Promise<void> {
-        const collection = this.db.collection<Protocol>('protocols');
-        const storedProtocols = await collection.find({}).toArray();
-        const ids = new Set(storedProtocols.map(p => p.id));
-        const toInsert: Protocol[] = [];
-
-        // https://www.mongodb.com/community/forums/t/just-to-point-out-do-not-name-a-field-language-if-you-are-planning-to-create-an-index/263793/2
-        for (let p of protocols) {
-            delete p['language'];
-        }
-        for (let p of protocols) {
-            if (!ids.has(p.id)) {
-                toInsert.push(p);
-            }
-        }
-        if (toInsert.length > 0) {
-            await collection.insertMany(toInsert);
-        }
-        const updates: any[] = [];
-        for (let p of protocols) {
-            if (ids.has(p.id)) {
-                updates.push({
-                    replaceOne: {
-                        filter: { id: p.id, },
-                        replacement: p,
-                    }
-                });
-            }
+    async getProtocolUpdateHistory(): Promise<JobUpdateHistory> {
+        const collection = this.db.collection('metadata');
+        return (await collection.findOne<JobUpdateHistory>({ id: 'protocol_run_history' })) || {
+            id: 'protocol_run_history',
+            histories: [],
+            lastUpdatedIndex: 0,
+            lastRunAt: 0,
         };
-        if (updates.length > 0) {
-            await collection.bulkWrite(updates);
+    }
+
+    async updateProtocolUpdateHistory(history: JobUpdateHistory): Promise<void> {
+        const collection = this.db.collection('metadata');
+        await collection.deleteOne({ id: 'protocol_run_history' })
+        await collection.insertOne(history);
+    }
+
+    async updateProtocol(protocol: Protocol): Promise<void> {
+        const collection = this.db.collection<Protocol>('protocols');
+        await collection.deleteOne({ id: protocol.id })
+        await collection.insertOne(protocol);
+    }
+
+    async updateChainTvls(slug: string, chainTvls: {
+        [key: string]: {
+            tvl: Array<TVL>
+            tokensInUsd: Array<{
+                date: number
+                tokens: TokenValue
+            }>
+            tokens: Array<{
+                date: number
+                tokens: TokenValue
+            }>
+        }
+    }): Promise<void> {
+        {
+            const tvlCollection = this.db.collection('protocol_tvls');
+            const records = Object.keys(chainTvls)
+                .flatMap(chain => chainTvls[chain].tvl
+                    .map(tvl => ({
+                        slug,
+                        chain,
+                        date: tvl.date,
+                        totalLiquidityUSD: tvl.totalLiquidityUSD,
+                    })));
+            if (records.length > 0) {
+                await tvlCollection.deleteMany({ slug, });
+                await tvlCollection.insertMany(records);
+            }
+        }
+        {
+            const tokenCollection = this.db.collection('protocol_tokens');
+            const records = Object.keys(chainTvls)
+                .flatMap(chain => {
+                    const usdByDateByToken = new Map<string, Map<number, number>>();
+                    chainTvls[chain].tokensInUsd.forEach(({ date, tokens }) => {
+                        Object.keys(tokens).forEach(t => {
+                            const usdByDate = usdByDateByToken.get(t) || new Map<number, number>();
+                            if (!usdByDateByToken.has(t)) {
+                                usdByDateByToken.set(t, usdByDate);
+                            }
+                            usdByDate.set(date, tokens[t]);
+                        });
+                    });
+                    return chainTvls[chain].tokens.flatMap(({ date, tokens }) => Object.keys(tokens)
+                        .map(t => ({
+                            slug,
+                            chain,
+                            token: t,
+                            date,
+                            amount: tokens[t],
+                            amountInUsd: usdByDateByToken.get(t)?.get(date) || 0
+                        })))
+                });
+            if (records.length > 0) {
+                await tokenCollection.deleteMany({ slug, });
+                await tokenCollection.insertMany(records);
+            }
         }
     }
+
 }
 
 
@@ -110,7 +177,7 @@ const init = async () => {
         await mongoStorage.initialize();
         return {
             defiLlamaClient: new DefiLlamaClient(),
-            mongo: new MongoStorage(mongo),
+            mongoStorage: mongoStorage,
             shutdown: async () => {
                 await mongo.close();
                 console.log("resources shut down successfully...");
@@ -123,22 +190,61 @@ const init = async () => {
 };
 
 
-
-
 const run = async () => {
     const {
         defiLlamaClient,
-        mongo,
+        mongoStorage,
         shutdown,
     } = await init();
 
-    const protocols = await defiLlamaClient.getAllProtocols();
-    await mongo.updateProtocols(protocols);
+    const update = async () => {
+        try {
+            const protocolUpdateHistory = await mongoStorage.getProtocolUpdateHistory();
+            const protocolSummaries = await defiLlamaClient.getAllProtocols();
+            const summaryByMap = new Map<string, Protocol>();
+            protocolSummaries.forEach(p => {
+                // https://www.mongodb.com/community/forums/t/just-to-point-out-do-not-name-a-field-language-if-you-are-planning-to-create-an-index/263793/2
+                delete p['language'];
+                summaryByMap.set(p.slug, p);
+            });
+
+
+            if (protocolSummaries.length !== protocolUpdateHistory.histories.length) {
+                const ids = new Set(protocolUpdateHistory.histories.map(h => h.id));
+                protocolSummaries.forEach(p => !ids.has(p.slug) && protocolUpdateHistory.histories.push({
+                    id: p.slug,
+                    updatedAt: '2000-01-1T00:00:00.000Z'
+                }));
+            }
+
+            for (let i = protocolUpdateHistory.lastUpdatedIndex % protocolUpdateHistory.histories.length; i < protocolUpdateHistory.histories.length; i++) {
+                const history = protocolUpdateHistory.histories[i];
+                const updateTime = new Date(Date.now() - 24 * 60 * 60 * 1000).toUTCString();
+                if (history.updatedAt > updateTime) {
+                    continue;
+                }
+                const detail = await defiLlamaClient.getProtocolDetail(history.id);
+                const protocol = summaryByMap.get(history.id);
+                protocol.currentChainTvls = detail.currentChainTvls;
+                await mongoStorage.updateChainTvls(history.id, detail.chainTvls);
+                protocolUpdateHistory.lastUpdatedIndex = i;
+                protocolUpdateHistory.lastRunAt = history.updatedAt = new Date().toUTCString();
+                await mongoStorage.updateProtocolUpdateHistory(protocolUpdateHistory);
+            }
+            return true;
+        } catch (e) {
+            console.error(e, 'reruning...');
+            return false;
+        }
+    }
+
+    while (!(await update()));
 
     await shutdown();
 };
 
 run();
+
 
 
 
