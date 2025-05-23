@@ -52,7 +52,6 @@ class DefiLlamaClient {
 
     async getProtocolDetail(slug: string): Promise<ProtocolDetail> {
         return this.client.get('/protocol/' + slug).then(res => {
-            console.log(slug, res.status);
             return res.data as ProtocolDetail;
         });
     }
@@ -161,6 +160,7 @@ class MongoStorage {
                         })))
                 });
             if (records.length > 0) {
+                console.log(`inserting ${records.length} records`);
                 await tokenCollection.deleteMany({ slug, });
                 await tokenCollection.insertMany(records);
             }
@@ -217,20 +217,28 @@ const run = async () => {
                 }));
             }
 
-            for (let i = protocolUpdateHistory.lastUpdatedIndex % protocolUpdateHistory.histories.length; i < protocolUpdateHistory.histories.length; i++) {
+            const startingIndex = protocolUpdateHistory.lastUpdatedIndex % protocolUpdateHistory.histories.length;
+
+            console.log(`staring from #${startingIndex}`);
+
+            for (let i = startingIndex; i < protocolUpdateHistory.histories.length; i++) {
                 const history = protocolUpdateHistory.histories[i];
-                const updateTime = new Date(Date.now() - 24 * 60 * 60 * 1000).toUTCString();
+                const updateTime = new Date(Date.now() - 24 * 60 * 60 * 1000).toISOString();
                 if (history.updatedAt > updateTime) {
+                    console.log(`#${i} ${history.id} last updated at ${updateTime}. skipping...`);
                     continue;
                 }
+                console.log(`running for #${i} ${history.id}`);
                 const detail = await defiLlamaClient.getProtocolDetail(history.id);
                 const protocol = summaryByMap.get(history.id);
                 protocol.currentChainTvls = detail.currentChainTvls;
                 await mongoStorage.updateChainTvls(history.id, detail.chainTvls);
                 protocolUpdateHistory.lastUpdatedIndex = i;
-                protocolUpdateHistory.lastRunAt = history.updatedAt = new Date().toUTCString();
+                protocolUpdateHistory.lastRunAt = history.updatedAt = new Date().toISOString();
                 await mongoStorage.updateProtocolUpdateHistory(protocolUpdateHistory);
             }
+            protocolUpdateHistory.lastUpdatedIndex = protocolUpdateHistory.histories.length;
+            await mongoStorage.updateProtocolUpdateHistory(protocolUpdateHistory);
             return true;
         } catch (e) {
             console.error(e, 'reruning...');
